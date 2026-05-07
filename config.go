@@ -12,19 +12,9 @@
 package natsadapter
 
 import (
-	"time"
-
 	"github.com/kamalyes/go-casbin/policy"
 	"github.com/kamalyes/go-logger"
 )
-
-// NATSConfig NATS 连接配置
-type NATSConfig struct {
-	URL       string        // NATS 服务器地址（默认 nats://localhost:4222）
-	Name      string        // 客户端名称
-	JetStream bool          // 是否启用 JetStream（持久化消息）
-	Timeout   time.Duration // 连接超时
-}
 
 // ChangeEvent NATS 适配器事件类型（与 policy.ChangeEvent 一致）
 type ChangeEvent = policy.ChangeEvent
