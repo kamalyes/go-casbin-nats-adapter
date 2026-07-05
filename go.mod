@@ -3,16 +3,16 @@ module github.com/kamalyes/go-casbin-nats-adapter
 go 1.25.0
 
 require (
-	github.com/kamalyes/go-casbin v0.1.2
-	github.com/kamalyes/go-logger v0.5.2
-	github.com/kamalyes/go-toolbox v0.15.1
+	github.com/kamalyes/go-casbin v0.1.5
+	github.com/kamalyes/go-logger v0.5.3
+	github.com/kamalyes/go-toolbox v0.15.3
 	github.com/nats-io/nats.go v1.39.1
 	github.com/stretchr/testify v1.11.1
 )
 
 require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
-	github.com/kamalyes/go-argus v0.2.0 // indirect
+	github.com/kamalyes/go-argus v0.2.1 // indirect
 	github.com/klauspost/compress v1.17.9 // indirect
 	github.com/nats-io/nkeys v0.4.9 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect

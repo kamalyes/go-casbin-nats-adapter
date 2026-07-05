@@ -14,13 +14,16 @@ package natsadapter
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/kamalyes/go-casbin/errors"
 	"github.com/kamalyes/go-casbin/policy"
+	"github.com/kamalyes/go-toolbox/pkg/syncx"
 	"github.com/nats-io/nats.go"
 )
 
 // Subscribe 订阅策略变更事件
+// 使用 syncx.EventLoop 启动事件循环，异步处理事件避免 handler 阻塞 NATS 消息投递
 func (nn *NATSNotifier) Subscribe(ctx context.Context, handler policy.ChangeEventHandler) error {
 	nn.mu.Lock()
 	defer nn.mu.Unlock()
@@ -31,6 +34,9 @@ func (nn *NATSNotifier) Subscribe(ctx context.Context, handler policy.ChangeEven
 
 	nn.handler = handler
 	nn.running = true
+
+	// 使用 syncx.EventLoop 启动事件处理循环（内置 panic 恢复和优雅关闭）
+	nn.startEventLoop()
 
 	var sub *nats.Subscription
 	var err error
@@ -43,6 +49,9 @@ func (nn *NATSNotifier) Subscribe(ctx context.Context, handler policy.ChangeEven
 
 	if err != nil {
 		nn.running = false
+		// 通知 EventLoop 退出
+		nn.workerCancel()
+		nn.wg.Wait()
 		return errors.NewPolicyWatchFailedError("failed to subscribe NATS subject: " + err.Error())
 	}
 
@@ -52,17 +61,46 @@ func (nn *NATSNotifier) Subscribe(ctx context.Context, handler policy.ChangeEven
 		"subject", nn.config.Channel,
 		"source", nn.config.Source,
 		"jetstream", nn.js != nil,
+		"buffer_size", cap(nn.eventCh),
 	)
 
 	return nil
 }
 
+// startEventLoop 使用 syncx.EventLoop 启动事件处理循环
+// 内置 panic 恢复、context 取消优雅关闭、OnShutdown 回调
+// 替代手写 select 循环 + recover，复用 go-toolbox 通用能力
+func (nn *NATSNotifier) startEventLoop() {
+	nn.wg.Add(1)
+	go func() {
+		defer nn.wg.Done()
+		syncx.NewEventLoop(nn.workerCtx).
+			OnChannel(nn.eventCh, func(event *ChangeEvent) {
+				nn.mu.RLock()
+				handler := nn.handler
+				nn.mu.RUnlock()
+				if handler != nil {
+					handler(event)
+				}
+			}).
+			OnPanic(func(r interface{}) {
+				nn.logger.ErrorKV("Event handler panic recovered",
+					"panic", fmt.Sprintf("%v", r),
+				)
+			}).
+			OnShutdown(func() {
+				nn.logger.InfoKV("NATS event loop shutdown")
+			}).
+			Run()
+	}()
+}
+
 // Unsubscribe 取消订阅
+// 通过 workerCancel 通知 EventLoop 退出，等待剩余事件处理完成
 func (nn *NATSNotifier) Unsubscribe() error {
 	nn.mu.Lock()
-	defer nn.mu.Unlock()
-
 	if !nn.running {
+		nn.mu.Unlock()
 		return nil
 	}
 
@@ -70,12 +108,24 @@ func (nn *NATSNotifier) Unsubscribe() error {
 	if nn.sub != nil {
 		_ = nn.sub.Unsubscribe()
 	}
+	nn.mu.Unlock()
+
+	// 通过 context 取消通知 EventLoop 退出并等待处理完剩余事件
+	nn.workerCancel()
+	nn.wg.Wait()
+
+	// 重置 context 和 eventCh，支持后续重新 Subscribe
+	nn.workerCtx, nn.workerCancel = context.WithCancel(context.Background())
+	nn.eventCh = make(chan *ChangeEvent, nn.config.BufferSize)
 
 	nn.logger.InfoKV("NATS notifier unsubscribed", "subject", nn.config.Channel)
 	return nil
 }
 
 // handleMessage 处理 NATS 消息
+// 反序列化 + 来源过滤后投递到 eventCh，由 EventLoop 异步处理
+// 非阻塞投递：channel 满时丢弃事件并告警（避免阻塞 NATS 消息投递 goroutine）
+// 丢弃事件后，下一个全量事件（PolicyReload）会修复一致性
 func (nn *NATSNotifier) handleMessage(msg *nats.Msg) {
 	var event ChangeEvent
 	if err := json.Unmarshal(msg.Data, &event); err != nil {
@@ -91,11 +141,15 @@ func (nn *NATSNotifier) handleMessage(msg *nats.Msg) {
 		return
 	}
 
-	nn.mu.RLock()
-	handler := nn.handler
-	nn.mu.RUnlock()
-
-	if handler != nil {
-		handler(&event)
+	// 非阻塞投递到 channel，避免阻塞 NATS 消息投递
+	select {
+	case nn.eventCh <- &event:
+	default:
+		// channel 满：丢弃事件，等待下一个全量事件修复一致性
+		nn.logger.WarnKV("Event buffer full, dropping event",
+			"event_type", string(event.Type),
+			"source", event.Source,
+			"buffer_size", cap(nn.eventCh),
+		)
 	}
 }

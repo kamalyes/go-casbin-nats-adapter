@@ -12,6 +12,7 @@
 package natsadapter
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -36,6 +37,8 @@ var _ policy.PolicyNotifier = (*NATSNotifier)(nil)
 //   - 消息去重：基于事件 ID 和来源节点过滤重复/自身事件
 //   - 发布重试：发布失败时自动重试
 //   - JetStream 可选：支持持久化消息（需要 NATS Server 启用 JetStream）
+//   - 异步处理：订阅消息投递到缓冲 channel，由 worker 顺序处理，
+//     避免 handler 执行 ReloadPolicy 阻塞 NATS 消息投递
 type NATSNotifier struct {
 	conn   *nats.Conn             // NATS 连接（外部传入，不由本通知器管理生命周期）
 	js     nats.JetStreamContext  // JetStream 上下文（可选，用于持久化）
@@ -44,6 +47,11 @@ type NATSNotifier struct {
 	logger logger.ILogger         // 日志记录器
 	idgen  idgen.IDGenerator      // ID 生成器
 	retry  *retry.Retry           // 发布重试器
+
+	eventCh      chan *ChangeEvent  // 事件缓冲 channel，单 worker 顺序处理保证事件顺序
+	workerCtx    context.Context    // worker 生命周期控制（用 syncx.EventLoop 监听）
+	workerCancel context.CancelFunc // worker 取消信号
+	wg           sync.WaitGroup     // 等待 worker 优雅退出
 
 	mu      sync.RWMutex              // 保护以下字段
 	running bool                      // 是否正在运行
@@ -73,15 +81,17 @@ func NewNATSNotifier(conn *nats.Conn, js nats.JetStreamContext, opts ...policy.N
 		config.Source = fmt.Sprintf("node-%s", idgen.NewIDGenerator(idgen.GeneratorTypeUUID).GenerateRequestID())
 	}
 
+	workerCtx, workerCancel := context.WithCancel(context.Background())
 	return &NATSNotifier{
-		conn:   conn,
-		js:     js,
-		config: config,
-		logger: logger.NewEmptyLogger(),
-		idgen:  idgen.NewIDGenerator(idgen.GeneratorTypeUUID),
-		retry: retry.NewRetry().
-			SetAttemptCount(config.RetryCount).
-			SetInterval(config.RetryInterval),
+		conn:         conn,
+		js:           js,
+		config:       config,
+		logger:       logger.NewEmptyLogger(),
+		idgen:        idgen.NewIDGenerator(idgen.GeneratorTypeUUID),
+		retry:        retry.NewRetry().SetAttemptCount(config.RetryCount).SetInterval(config.RetryInterval),
+		eventCh:      make(chan *ChangeEvent, config.BufferSize),
+		workerCtx:    workerCtx,
+		workerCancel: workerCancel,
 	}, nil
 }
 
@@ -92,5 +102,3 @@ func (nn *NATSNotifier) Close() error {
 	// 不关闭 conn，因为它是外部传入的，由外部管理生命周期
 	return nil
 }
-
-
