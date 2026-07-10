@@ -3,9 +3,9 @@ module github.com/kamalyes/go-casbin-nats-adapter
 go 1.25.0
 
 require (
-	github.com/kamalyes/go-casbin v0.1.5
+	github.com/kamalyes/go-casbin v0.1.6-0.20260710085027-037030a12e68
 	github.com/kamalyes/go-logger v0.5.3
-	github.com/kamalyes/go-toolbox v0.15.3
+	github.com/kamalyes/go-toolbox v0.15.4-0.20260708035853-0906a957860d
 	github.com/nats-io/nats.go v1.39.1
 	github.com/stretchr/testify v1.11.1
 )

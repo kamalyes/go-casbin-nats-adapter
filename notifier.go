@@ -78,7 +78,9 @@ func NewNATSNotifier(conn *nats.Conn, js nats.JetStreamContext, opts ...policy.N
 	}
 
 	if config.Source == "unknown" {
-		config.Source = fmt.Sprintf("node-%s", idgen.NewIDGenerator(idgen.GeneratorTypeUUID).GenerateRequestID())
+		// 使用 SnowflakeGenerator 生成短节点 ID（比 UUID 更快，纯位运算）
+		flake := idgen.NewSnowflakeGenerator(1, 1)
+		config.Source = fmt.Sprintf("node-%s", flake.GenerateTraceID()[:12])
 	}
 
 	workerCtx, workerCancel := context.WithCancel(context.Background())
@@ -87,7 +89,7 @@ func NewNATSNotifier(conn *nats.Conn, js nats.JetStreamContext, opts ...policy.N
 		js:           js,
 		config:       config,
 		logger:       logger.NewEmptyLogger(),
-		idgen:        idgen.NewIDGenerator(idgen.GeneratorTypeUUID),
+		idgen:        idgen.NewSnowflakeGenerator(1, 1),
 		retry:        retry.NewRetry().SetAttemptCount(config.RetryCount).SetInterval(config.RetryInterval),
 		eventCh:      make(chan *ChangeEvent, config.BufferSize),
 		workerCtx:    workerCtx,

@@ -13,7 +13,6 @@ package natsadapter
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 
 	"github.com/kamalyes/go-casbin/errors"
@@ -70,12 +69,14 @@ func (nn *NATSNotifier) Subscribe(ctx context.Context, handler policy.ChangeEven
 // startEventLoop 使用 syncx.EventLoop 启动事件处理循环
 // 内置 panic 恢复、context 取消优雅关闭、OnShutdown 回调
 // 替代手写 select 循环 + recover，复用 go-toolbox 通用能力
+// 消费完事件后调用 releaseEvent 归还到对象池，减少 GC 压力
 func (nn *NATSNotifier) startEventLoop() {
 	nn.wg.Add(1)
 	go func() {
 		defer nn.wg.Done()
 		syncx.NewEventLoop(nn.workerCtx).
 			OnChannel(nn.eventCh, func(event *ChangeEvent) {
+				defer releaseEvent(event)
 				nn.mu.RLock()
 				handler := nn.handler
 				nn.mu.RUnlock()
@@ -123,12 +124,13 @@ func (nn *NATSNotifier) Unsubscribe() error {
 }
 
 // handleMessage 处理 NATS 消息
-// 反序列化 + 来源过滤后投递到 eventCh，由 EventLoop 异步处理
+// 二进制反序列化 + 来源过滤后投递到 eventCh，由 EventLoop 异步处理
 // 非阻塞投递：channel 满时丢弃事件并告警（避免阻塞 NATS 消息投递 goroutine）
 // 丢弃事件后，下一个全量事件（PolicyReload）会修复一致性
+// 投递成功后由 EventLoop 消费时 releaseEvent 归还到对象池
 func (nn *NATSNotifier) handleMessage(msg *nats.Msg) {
-	var event ChangeEvent
-	if err := json.Unmarshal(msg.Data, &event); err != nil {
+	event, err := UnmarshalEvent(msg.Data)
+	if err != nil {
 		nn.logger.WarnKV("Failed to unmarshal NATS event", "error", err.Error())
 		return
 	}
@@ -138,14 +140,16 @@ func (nn *NATSNotifier) handleMessage(msg *nats.Msg) {
 			"event_type", string(event.Type),
 			"source", event.Source,
 		)
+		releaseEvent(event)
 		return
 	}
 
 	// 非阻塞投递到 channel，避免阻塞 NATS 消息投递
 	select {
-	case nn.eventCh <- &event:
+	case nn.eventCh <- event:
 	default:
-		// channel 满：丢弃事件，等待下一个全量事件修复一致性
+		// channel 满：丢弃事件，归还到池，等待下一个全量事件修复一致性
+		releaseEvent(event)
 		nn.logger.WarnKV("Event buffer full, dropping event",
 			"event_type", string(event.Type),
 			"source", event.Source,
