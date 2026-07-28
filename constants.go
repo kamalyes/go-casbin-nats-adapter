@@ -14,7 +14,7 @@ package natsadapter
 import "time"
 
 const (
-	natsReconnectWait = 2 * time.Second // NATS 重连等待时间
-	natsMaxReconnects = 10              // NATS 最大重连次数
-	jetStreamName     = "CASBIN_POLICY" // JetStream Stream 名称
+	natsReconnectWait = 2 * time.Second  // NATS 重连等待时间
+	natsMaxReconnects = 10               // NATS 最大重连次数
+	JetStreamName     = "CASBIN_POLICY"  // JetStream Stream 名称（导出供外部 EnsureStream 使用）
 )
