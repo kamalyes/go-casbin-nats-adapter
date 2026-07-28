@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	testNATSURL     = "nats://120.77.38.35:4222"
+	testNATSURL     = "nats://192.168.1.10:4222"
 	testSubject     = "casbin.policy.test"
 	testTimeout     = 5 * time.Second
 	testWaitMessage = 2 * time.Second
@@ -124,7 +124,8 @@ func TestPublishAndSubscribe(t *testing.T) {
 
 		var receivedEvent *ChangeEvent
 		err = subscriber.Subscribe(context.Background(), func(event *ChangeEvent) {
-			receivedEvent = event
+			evt := *event
+			receivedEvent = &evt
 			wg.Done()
 		})
 		require.NoError(t, err, "Should subscribe successfully")
@@ -177,7 +178,8 @@ func TestPublishAndSubscribe(t *testing.T) {
 
 		var receivedEvent *ChangeEvent
 		err = subscriber.Subscribe(context.Background(), func(event *ChangeEvent) {
-			receivedEvent = event
+			evt := *event
+			receivedEvent = &evt
 			wg.Done()
 		})
 		require.NoError(t, err)
@@ -226,7 +228,8 @@ func TestPublishAndSubscribe(t *testing.T) {
 
 		var receivedEvent *ChangeEvent
 		err = subscriber.Subscribe(context.Background(), func(event *ChangeEvent) {
-			receivedEvent = event
+			evt := *event
+			receivedEvent = &evt
 			wg.Done()
 		})
 		require.NoError(t, err)
@@ -277,7 +280,8 @@ func TestPublishAndSubscribe(t *testing.T) {
 
 		var receivedEvent *ChangeEvent
 		err = subscriber.Subscribe(context.Background(), func(event *ChangeEvent) {
-			receivedEvent = event
+			evt := *event
+			receivedEvent = &evt
 			wg.Done()
 		})
 		require.NoError(t, err)
@@ -543,7 +547,8 @@ func TestEventTimestamp(t *testing.T) {
 
 	var receivedEvent *ChangeEvent
 	err = subscriber.Subscribe(context.Background(), func(event *ChangeEvent) {
-		receivedEvent = event
+		evt := *event
+		receivedEvent = &evt
 		wg.Done()
 	})
 	require.NoError(t, err)

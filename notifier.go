@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/kamalyes/go-casbin/errors"
 	"github.com/kamalyes/go-casbin/policy"
@@ -102,5 +103,30 @@ func NewNATSNotifier(conn *nats.Conn, js nats.JetStreamContext, opts ...policy.N
 func (nn *NATSNotifier) Close() error {
 	_ = nn.Unsubscribe()
 	// 不关闭 conn，因为它是外部传入的，由外部管理生命周期
+	return nil
+}
+
+// EnsureStream 确保 JetStream Stream 存在（幂等）
+// 在启用 JetStream 时调用，创建或更新匹配指定 subjects 的 Stream
+// 配置 MaxAge=1h 限制历史消息保留时间，避免新 Durable consumer 启动时回放过量旧事件
+// 应在创建 NATSNotifier 之前调用一次（如服务启动阶段），保证后续 Publish/Subscribe 不会因 Stream 缺失而失败
+func EnsureStream(js nats.JetStreamContext, name string, subjects []string) error {
+	if js == nil {
+		return fmt.Errorf("JetStream context is nil")
+	}
+
+	cfg := &nats.StreamConfig{
+		Name:      name,
+		Subjects:  subjects,
+		Retention: nats.LimitsPolicy,
+		MaxAge:    time.Hour,
+	}
+
+	// 先尝试创建，已存在则更新（幂等）
+	if _, err := js.AddStream(cfg); err != nil {
+		if _, err := js.UpdateStream(cfg); err != nil {
+			return fmt.Errorf("ensure stream %s failed: %w", name, err)
+		}
+	}
 	return nil
 }

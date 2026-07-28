@@ -109,8 +109,9 @@ func TestPolicyEventSequence(t *testing.T) {
 	wg.Add(4)
 
 	err = subscriber.Subscribe(context.Background(), func(event *ChangeEvent) {
+		evt := *event
 		mu.Lock()
-		receivedEvents = append(receivedEvents, event)
+		receivedEvents = append(receivedEvents, &evt)
 		mu.Unlock()
 		wg.Done()
 	})
@@ -434,7 +435,8 @@ func TestEventMetadata(t *testing.T) {
 
 	var receivedEvent *ChangeEvent
 	err = subscriber.Subscribe(context.Background(), func(event *ChangeEvent) {
-		receivedEvent = event
+		evt := *event
+		receivedEvent = &evt
 		wg.Done()
 	})
 	require.NoError(t, err)
