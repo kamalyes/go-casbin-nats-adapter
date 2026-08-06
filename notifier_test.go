@@ -13,7 +13,10 @@ package natsadapter
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -577,6 +580,407 @@ func TestEventTimestamp(t *testing.T) {
 	case <-time.After(testWaitMessage):
 		t.Fatal("Timeout waiting for event")
 	}
+}
+
+// mockJetStreamContext 用于测试的 JetStreamContext 桩实现
+// 嵌入 nil 接口满足编译，仅覆盖测试需要的方法
+type mockJetStreamContext struct {
+	nats.JetStreamContext
+	publishFn      func(subj string, data []byte, opts ...nats.PubOpt) (*nats.PubAck, error)
+	addStreamFn    func(cfg *nats.StreamConfig, opts ...nats.JSOpt) (*nats.StreamInfo, error)
+	updateStreamFn func(cfg *nats.StreamConfig, opts ...nats.JSOpt) (*nats.StreamInfo, error)
+}
+
+func (m *mockJetStreamContext) Publish(subj string, data []byte, opts ...nats.PubOpt) (*nats.PubAck, error) {
+	if m.publishFn != nil {
+		return m.publishFn(subj, data, opts...)
+	}
+	return &nats.PubAck{}, nil
+}
+
+func (m *mockJetStreamContext) AddStream(cfg *nats.StreamConfig, opts ...nats.JSOpt) (*nats.StreamInfo, error) {
+	if m.addStreamFn != nil {
+		return m.addStreamFn(cfg, opts...)
+	}
+	return &nats.StreamInfo{}, nil
+}
+
+func (m *mockJetStreamContext) UpdateStream(cfg *nats.StreamConfig, opts ...nats.JSOpt) (*nats.StreamInfo, error) {
+	if m.updateStreamFn != nil {
+		return m.updateStreamFn(cfg, opts...)
+	}
+	return &nats.StreamInfo{}, nil
+}
+
+// TestEnsureStream 测试 EnsureStream 的各路径
+func TestEnsureStream(t *testing.T) {
+	t.Run("NilJetStream", func(t *testing.T) {
+		err := EnsureStream(nil, "test-stream", []string{"test.>"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "JetStream context is nil")
+	})
+
+	t.Run("AddStreamSuccess", func(t *testing.T) {
+		conn := setupNATSConnection(t)
+		defer conn.Close()
+		js, err := conn.JetStream()
+		require.NoError(t, err)
+
+		streamName := "TEST_ENSURE_ADD_" + fmt.Sprintf("%d", time.Now().UnixNano())
+		defer js.DeleteStream(streamName)
+
+		err = EnsureStream(js, streamName, []string{testSubject + ".ensure.add.>"})
+		require.NoError(t, err)
+	})
+
+	t.Run("UpdateStreamSuccess", func(t *testing.T) {
+		conn := setupNATSConnection(t)
+		defer conn.Close()
+		js, err := conn.JetStream()
+		require.NoError(t, err)
+
+		streamName := "TEST_ENSURE_UPD_" + fmt.Sprintf("%d", time.Now().UnixNano())
+		defer js.DeleteStream(streamName)
+
+		// 第一次调用：AddStream 成功
+		err = EnsureStream(js, streamName, []string{testSubject + ".ensure.upd.>"})
+		require.NoError(t, err)
+		// 第二次调用：AddStream 失败（已存在），UpdateStream 成功
+		err = EnsureStream(js, streamName, []string{testSubject + ".ensure.upd.>"})
+		require.NoError(t, err)
+	})
+
+	t.Run("BothFail", func(t *testing.T) {
+		mockJS := &mockJetStreamContext{
+			addStreamFn: func(cfg *nats.StreamConfig, opts ...nats.JSOpt) (*nats.StreamInfo, error) {
+				return nil, errors.New("add stream failed")
+			},
+			updateStreamFn: func(cfg *nats.StreamConfig, opts ...nats.JSOpt) (*nats.StreamInfo, error) {
+				return nil, errors.New("update stream failed")
+			},
+		}
+		err := EnsureStream(mockJS, "fail-stream", []string{"fail.>"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "ensure stream fail-stream failed")
+	})
+}
+
+// TestPublishEdgeCases 测试 Publish 的边缘路径
+func TestPublishEdgeCases(t *testing.T) {
+	t.Run("ZeroTimestamp", func(t *testing.T) {
+		conn := setupNATSConnection(t)
+		defer conn.Close()
+
+		notifier, err := NewNATSNotifier(conn, nil,
+			policy.WithChannel(testSubject+".zero-ts"),
+			policy.WithSource("test-node"),
+		)
+		require.NoError(t, err)
+		defer notifier.Close()
+
+		// 手动构造零时间戳事件，覆盖 Publish 中 IsZero 分支
+		event := &policy.ChangeEvent{
+			Type:      policy.EventTypePolicyAdded,
+			PType:     "p",
+			NewPolicy: []string{"alice", "data1", "read"},
+		}
+		err = notifier.Publish(context.Background(), event)
+		require.NoError(t, err)
+		assert.False(t, event.Timestamp.IsZero(), "Publish 应填充时间戳")
+	})
+
+	t.Run("MarshalError", func(t *testing.T) {
+		conn := setupNATSConnection(t)
+		defer conn.Close()
+
+		notifier, err := NewNATSNotifier(conn, nil,
+			policy.WithChannel(testSubject+".marshal-err"),
+			policy.WithSource("test-node"),
+		)
+		require.NoError(t, err)
+		defer notifier.Close()
+
+		orig := marshalEvent
+		marshalEvent = func(e *policy.ChangeEvent) ([]byte, error) {
+			return nil, errors.New("injected marshal error")
+		}
+		defer func() { marshalEvent = orig }()
+
+		err = notifier.PublishPolicyAdded(context.Background(), "p", []string{"a"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to marshal event")
+	})
+
+	t.Run("RetrySuccess", func(t *testing.T) {
+		conn := setupNATSConnection(t)
+		defer conn.Close()
+
+		var attempts int32
+		mockJS := &mockJetStreamContext{
+			publishFn: func(subj string, data []byte, opts ...nats.PubOpt) (*nats.PubAck, error) {
+				if atomic.AddInt32(&attempts, 1) == 1 {
+					return nil, errors.New("injected transient failure")
+				}
+				return &nats.PubAck{Stream: "test", Sequence: 1}, nil
+			},
+		}
+
+		notifier, err := NewNATSNotifier(conn, mockJS,
+			policy.WithChannel(testSubject+".retry"),
+			policy.WithSource("test-node"),
+			policy.WithRetry(time.Millisecond, 3),
+		)
+		require.NoError(t, err)
+		defer notifier.Close()
+
+		err = notifier.PublishPolicyAdded(context.Background(), "p", []string{"a"})
+		require.NoError(t, err)
+		assert.Equal(t, int32(2), atomic.LoadInt32(&attempts), "第一次失败后重试成功")
+	})
+
+	t.Run("RetryExhausted", func(t *testing.T) {
+		conn := setupNATSConnection(t)
+		defer conn.Close()
+
+		var attempts int32
+		mockJS := &mockJetStreamContext{
+			publishFn: func(subj string, data []byte, opts ...nats.PubOpt) (*nats.PubAck, error) {
+				atomic.AddInt32(&attempts, 1)
+				return nil, errors.New("permanent failure")
+			},
+		}
+
+		notifier, err := NewNATSNotifier(conn, mockJS,
+			policy.WithChannel(testSubject+".retry-exhaust"),
+			policy.WithSource("test-node"),
+			policy.WithRetry(time.Millisecond, 2),
+		)
+		require.NoError(t, err)
+		defer notifier.Close()
+
+		err = notifier.PublishPolicyAdded(context.Background(), "p", []string{"a"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to publish event to NATS")
+	})
+
+	t.Run("JetStreamPublishOnce", func(t *testing.T) {
+		conn := setupNATSConnection(t)
+		defer conn.Close()
+		js, err := conn.JetStream()
+		require.NoError(t, err)
+
+		streamName := "TEST_PUB_JS_" + fmt.Sprintf("%d", time.Now().UnixNano())
+		subject := testSubject + ".js.pub"
+		require.NoError(t, EnsureStream(js, streamName, []string{subject}))
+		defer js.DeleteStream(streamName)
+
+		notifier, err := NewNATSNotifier(conn, js,
+			policy.WithChannel(subject),
+			policy.WithSource("js-publisher"),
+		)
+		require.NoError(t, err)
+		defer notifier.Close()
+
+		err = notifier.PublishPolicyAdded(context.Background(), "p", []string{"alice", "data1", "read"})
+		require.NoError(t, err)
+	})
+}
+
+// TestSubscribeEdgeCases 测试 Subscribe 的边缘路径
+func TestSubscribeEdgeCases(t *testing.T) {
+	t.Run("JetStreamSubscribe", func(t *testing.T) {
+		conn := setupNATSConnection(t)
+		defer conn.Close()
+		js, err := conn.JetStream()
+		require.NoError(t, err)
+
+		streamName := "TEST_SUB_JS_" + fmt.Sprintf("%d", time.Now().UnixNano())
+		subject := testSubject + ".js.sub"
+		require.NoError(t, EnsureStream(js, streamName, []string{subject}))
+		defer js.DeleteStream(streamName)
+
+		publisher, err := NewNATSNotifier(conn, js,
+			policy.WithChannel(subject),
+			policy.WithSource("js-pub"),
+		)
+		require.NoError(t, err)
+		defer publisher.Close()
+
+		subscriber, err := NewNATSNotifier(conn, js,
+			policy.WithChannel(subject),
+			policy.WithSource("js-sub-"+fmt.Sprintf("%d", time.Now().UnixNano())),
+		)
+		require.NoError(t, err)
+		defer subscriber.Close()
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		var received *ChangeEvent
+		err = subscriber.Subscribe(context.Background(), func(event *ChangeEvent) {
+			evt := *event
+			received = &evt
+			wg.Done()
+		})
+		require.NoError(t, err)
+
+		time.Sleep(200 * time.Millisecond)
+
+		err = publisher.PublishPolicyAdded(context.Background(), "p", []string{"alice", "data1", "read"})
+		require.NoError(t, err)
+
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		select {
+		case <-done:
+			require.NotNil(t, received)
+			assert.Equal(t, policy.EventTypePolicyAdded, received.Type)
+		case <-time.After(testWaitMessage):
+			t.Fatal("Timeout waiting for JetStream event")
+		}
+	})
+
+	t.Run("SubscribeWithClosedConnection", func(t *testing.T) {
+		testConn, err := nats.Connect(testNATSURL)
+		require.NoError(t, err)
+		testConn.Close()
+
+		notifier, err := NewNATSNotifier(testConn, nil,
+			policy.WithChannel(testSubject+".closed-sub"),
+			policy.WithSource("test-node"),
+		)
+		require.NoError(t, err)
+		defer notifier.Close()
+
+		err = notifier.Subscribe(context.Background(), func(event *ChangeEvent) {})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to subscribe NATS subject")
+	})
+}
+
+// TestHandleMessageEdgeCases 测试 handleMessage 的边缘路径
+func TestHandleMessageEdgeCases(t *testing.T) {
+	t.Run("UnmarshalError", func(t *testing.T) {
+		conn := setupNATSConnection(t)
+		defer conn.Close()
+
+		subject := testSubject + ".bad-data"
+		notifier, err := NewNATSNotifier(conn, nil,
+			policy.WithChannel(subject),
+			policy.WithSource("bad-data-sub"),
+		)
+		require.NoError(t, err)
+		defer notifier.Close()
+
+		// 订阅不应该收到任何有效事件
+		err = notifier.Subscribe(context.Background(), func(event *ChangeEvent) {
+			t.Error("Should not receive event for invalid data")
+		})
+		require.NoError(t, err)
+
+		time.Sleep(100 * time.Millisecond)
+
+		// 直接发布无效二进制数据到 subject，触发 handleMessage 中的 UnmarshalEvent 错误
+		err = conn.Publish(subject, []byte{0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x01})
+		require.NoError(t, err)
+
+		// 等待确保消息被处理但不触发 handler
+		time.Sleep(300 * time.Millisecond)
+	})
+
+	t.Run("ChannelFullDrop", func(t *testing.T) {
+		conn := setupNATSConnection(t)
+		defer conn.Close()
+
+		subject := testSubject + ".channel-full"
+		publisher, err := NewNATSNotifier(conn, nil,
+			policy.WithChannel(subject),
+			policy.WithSource("full-pub"),
+		)
+		require.NoError(t, err)
+		defer publisher.Close()
+
+		subscriber, err := NewNATSNotifier(conn, nil,
+			policy.WithChannel(subject),
+			policy.WithSource("full-sub"),
+			policy.WithBufferSize(1),
+		)
+		require.NoError(t, err)
+		defer subscriber.Close()
+
+		// 用阻塞 handler 填满 channel 后触发丢弃
+		blockCh := make(chan struct{})
+		receivedCount := int32(0)
+		err = subscriber.Subscribe(context.Background(), func(event *ChangeEvent) {
+			atomic.AddInt32(&receivedCount, 1)
+			<-blockCh // 阻塞直到测试释放
+		})
+		require.NoError(t, err)
+
+		time.Sleep(100 * time.Millisecond)
+
+		// 发布多个事件：第一个被 handler 处理（阻塞），第二个填满 channel，后续被丢弃
+		for i := 0; i < 5; i++ {
+			err := publisher.PublishPolicyAdded(context.Background(), "p", []string{"u", "d", "r"})
+			require.NoError(t, err)
+		}
+
+		// 等待消息投递完成
+		time.Sleep(500 * time.Millisecond)
+
+		// 释放阻塞的 handler，让 EventLoop 处理 channel 中剩余的 1 个事件
+		close(blockCh)
+		time.Sleep(300 * time.Millisecond)
+
+		// handler 最多收到 2 个事件（1 个正在处理 + 1 个在 channel 缓冲中），其余被丢弃
+		count := atomic.LoadInt32(&receivedCount)
+		assert.LessOrEqual(t, count, int32(2), "Should drop events when channel is full, got %d", count)
+	})
+
+	t.Run("HandlerPanicRecovery", func(t *testing.T) {
+		conn := setupNATSConnection(t)
+		defer conn.Close()
+
+		subject := testSubject + ".panic"
+		publisher, err := NewNATSNotifier(conn, nil,
+			policy.WithChannel(subject),
+			policy.WithSource("panic-pub"),
+		)
+		require.NoError(t, err)
+		defer publisher.Close()
+
+		panicTriggered := make(chan struct{})
+		subscriber, err := NewNATSNotifier(conn, nil,
+			policy.WithChannel(subject),
+			policy.WithSource("panic-sub"),
+		)
+		require.NoError(t, err)
+		defer subscriber.Close()
+
+		err = subscriber.Subscribe(context.Background(), func(event *ChangeEvent) {
+			close(panicTriggered)
+			panic("test panic in handler")
+		})
+		require.NoError(t, err)
+
+		time.Sleep(100 * time.Millisecond)
+
+		err = publisher.PublishPolicyAdded(context.Background(), "p", []string{"alice", "data1", "read"})
+		require.NoError(t, err)
+
+		// 等待 handler 被触发
+		select {
+		case <-panicTriggered:
+		case <-time.After(testWaitMessage):
+			t.Fatal("Timeout waiting for handler to be triggered")
+		}
+
+		// 等待 panic 恢复
+		time.Sleep(200 * time.Millisecond)
+
+		// 验证 notifier 仍可正常取消订阅（EventLoop 未崩溃）
+		err = subscriber.Unsubscribe()
+		assert.NoError(t, err, "EventLoop should recover from panic and remain functional")
+	})
 }
 
 // BenchmarkPublish 基准测试：发布性能

@@ -19,6 +19,9 @@ import (
 	"github.com/kamalyes/go-casbin/policy"
 )
 
+// marshalEvent 编码函数变量，默认指向 MarshalEvent，可在测试中替换以模拟编码失败
+var marshalEvent = MarshalEvent
+
 // Publish 发布策略变更事件到 NATS Subject
 // 成功路径直接发送，失败才进入 retry 循环，避免每次都走 retry.Do 的加锁+caller 查找开销
 func (nn *NATSNotifier) Publish(ctx context.Context, event *policy.ChangeEvent) error {
@@ -29,7 +32,7 @@ func (nn *NATSNotifier) Publish(ctx context.Context, event *policy.ChangeEvent) 
 	}
 
 	// 二进制编码（零反射，buffer 池复用）
-	data, err := MarshalEvent(event)
+	data, err := marshalEvent(event)
 	if err != nil {
 		return errors.NewPolicyWatchFailedError("failed to marshal event: " + err.Error())
 	}

@@ -12,6 +12,7 @@
 package natsadapter
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"testing"
 	"time"
@@ -149,6 +150,122 @@ func TestUnmarshalInvalidData(t *testing.T) {
 	// 空数据
 	_, err = UnmarshalEvent([]byte{})
 	assert.Error(t, err)
+}
+
+// TestReadLenStringLengthExceedsBuffer 覆盖 readLenString 中 off+n > len(buf) 分支
+func TestReadLenStringLengthExceedsBuffer(t *testing.T) {
+	// 长度前缀声明 5 字节，但实际只跟 1 字节
+	bad := make([]byte, 0)
+	bad = binary.BigEndian.AppendUint32(bad, 5)
+	bad = append(bad, 'x')
+	_, err := UnmarshalEvent(bad)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "exceeds buffer")
+}
+
+// TestUnmarshalEventFieldErrors 覆盖 UnmarshalEvent 各字段读取失败的错误路径
+func TestUnmarshalEventFieldErrors(t *testing.T) {
+	// 构建合法前缀的辅助函数
+	validPrefix := func() []byte {
+		buf := make([]byte, 0)
+		buf = appendLenString(buf, "id")
+		buf = appendLenString(buf, string(policy.EventTypePolicyAdded))
+		buf = appendLenString(buf, "p")
+		buf = appendStringSlice(buf, []string{"a"})
+		buf = appendStringSlice(buf, []string{"b"})
+		buf = appendLenString(buf, "src")
+		return buf
+	}
+
+	t.Run("BadType", func(t *testing.T) {
+		buf := make([]byte, 0)
+		buf = appendLenString(buf, "id")
+		buf = append(buf, 0, 0, 0, 5) // Type 长度=5，无数据
+		_, err := UnmarshalEvent(buf)
+		assert.Error(t, err)
+	})
+
+	t.Run("BadPType", func(t *testing.T) {
+		buf := make([]byte, 0)
+		buf = appendLenString(buf, "id")
+		buf = appendLenString(buf, string(policy.EventTypePolicyAdded))
+		buf = append(buf, 0, 0, 0, 5) // PType 长度=5，无数据
+		_, err := UnmarshalEvent(buf)
+		assert.Error(t, err)
+	})
+
+	t.Run("OldPolicyCountTruncated", func(t *testing.T) {
+		buf := make([]byte, 0)
+		buf = appendLenString(buf, "id")
+		buf = appendLenString(buf, string(policy.EventTypePolicyAdded))
+		buf = appendLenString(buf, "p")
+		buf = append(buf, 0, 0, 0) // OldPolicy count 前缀只有 3 字节
+		_, err := UnmarshalEvent(buf)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "unexpected end of buffer")
+	})
+
+	t.Run("OldPolicyElementBad", func(t *testing.T) {
+		buf := make([]byte, 0)
+		buf = appendLenString(buf, "id")
+		buf = appendLenString(buf, string(policy.EventTypePolicyAdded))
+		buf = appendLenString(buf, "p")
+		buf = append(buf, 0, 0, 0, 1) // OldPolicy count=1
+		buf = append(buf, 0, 0, 0, 5) // 元素长度=5，无数据
+		_, err := UnmarshalEvent(buf)
+		assert.Error(t, err)
+	})
+
+	t.Run("NewPolicyCountTruncated", func(t *testing.T) {
+		buf := make([]byte, 0)
+		buf = appendLenString(buf, "id")
+		buf = appendLenString(buf, string(policy.EventTypePolicyAdded))
+		buf = appendLenString(buf, "p")
+		buf = appendStringSlice(buf, []string{"a"})
+		buf = append(buf, 0, 0, 0) // NewPolicy count 前缀只有 3 字节
+		_, err := UnmarshalEvent(buf)
+		assert.Error(t, err)
+	})
+
+	t.Run("BadSource", func(t *testing.T) {
+		buf := make([]byte, 0)
+		buf = appendLenString(buf, "id")
+		buf = appendLenString(buf, string(policy.EventTypePolicyAdded))
+		buf = appendLenString(buf, "p")
+		buf = appendStringSlice(buf, []string{"a"})
+		buf = appendStringSlice(buf, []string{"b"})
+		buf = append(buf, 0, 0, 0, 5) // Source 长度=5，无数据
+		_, err := UnmarshalEvent(buf)
+		assert.Error(t, err)
+	})
+
+	t.Run("TimestampTruncated", func(t *testing.T) {
+		buf := validPrefix()
+		// validPrefix 包含完整 Source，追加部分时间戳（不足 8 字节）
+		buf = append(buf, 0, 0, 0) // 只有 3 字节时间戳
+		_, err := UnmarshalEvent(buf)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "timestamp exceeds buffer")
+	})
+}
+
+// TestReadStringSliceEmptyAndErrors 直接测试 readStringSlice 的边界
+func TestReadStringSliceEmptyAndErrors(t *testing.T) {
+	t.Run("EmptySlice", func(t *testing.T) {
+		buf := make([]byte, 0)
+		buf = binary.BigEndian.AppendUint32(buf, 0) // count=0
+		ss, off, err := readStringSlice(buf, 0)
+		require.NoError(t, err)
+		assert.Nil(t, ss)
+		assert.Equal(t, 4, off)
+	})
+
+	t.Run("CountExceedsBuffer", func(t *testing.T) {
+		// count 前缀不完整
+		buf := []byte{0, 0, 0}
+		_, _, err := readStringSlice(buf, 0)
+		assert.Error(t, err)
+	})
 }
 
 func BenchmarkCodecMarshal(b *testing.B) {
