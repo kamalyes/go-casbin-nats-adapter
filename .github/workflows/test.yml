@@ -1,0 +1,78 @@
+name: Test
+
+# 实际流程全在 kamalyes/deploy-pipeline 的 go-library-test.yml 里，所有 Go 库共用一份
+# 改那一份就等于改所有库
+#
+# 这里**不配矩阵**：共用流水线从本仓库 go.mod 的 go 指令算出地板，上限取 Go 官方当前
+# 发布的最新两个小版本，于是 Go 发新版之后矩阵自己跟上
+# 低于地板的版本会被工具链切换静默顶上去，流水线的 Verify Toolchain Honesty 闸门会判红
+#
+# [EN] The pipeline lives in go-library-test.yml in kamalyes/deploy-pipeline, shared by every
+# Go library here. The matrix is not configured: its floor comes from this module's go
+# directive and its ceiling from the two most recent Go releases
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+
+jobs:
+  test:
+    uses: kamalyes/deploy-pipeline/.github/workflows/go-library-test.yml@master
+    with:
+      # 测试需要真实的 NATS 服务。job 的 services 块不能由 input 动态生成，所以走这里
+      #
+      # 相比原先按平台分开的六个步骤，这里合成一个 case 分支，并修掉两处问题：
+      #   原先 macOS 那两步里，无 arch 守卫的 amd64 步骤会先跑一遍再被 arm64 覆盖
+      #   原先用固定的 sleep 2 等启动，机器一慢就偶发失败，改成轮询 healthz
+      # [EN] The tests need a real NATS server, started here because a services block cannot be
+      # generated from an input. One branching script replaces six per-platform steps and fixes
+      # two problems: the amd64 step used to run and be overwritten on arm64, and a fixed sleep
+      # is replaced by polling the health endpoint
+      setup-script: |
+        set -euo pipefail
+        V=2.12.7
+        case "$RUNNER_OS" in
+          Linux)   pkg="nats-server-v${V}-linux-amd64";   ext=tar.gz ;;
+          Windows) pkg="nats-server-v${V}-windows-amd64"; ext=zip ;;
+          macOS)   if [ "$RUNNER_ARCH" = "ARM64" ]; then
+                     pkg="nats-server-v${V}-darwin-arm64"
+                   else
+                     pkg="nats-server-v${V}-darwin-amd64"
+                   fi
+                   ext=tar.gz ;;
+          *) echo "::error title=未知平台 | Unknown platform::$RUNNER_OS"; exit 1 ;;
+        esac
+
+        curl -fsSL -o "nats.${ext}" \
+          "https://github.com/nats-io/nats-server/releases/download/v${V}/${pkg}.${ext}"
+        if [ "$ext" = zip ]; then unzip -q "nats.${ext}"; else tar -xzf "nats.${ext}"; fi
+
+        exe=nats-server
+        [ "$RUNNER_OS" = Windows ] && exe=nats-server.exe
+        mkdir -p "$HOME/.local/bin"
+        cp "${pkg}/${exe}" "$HOME/.local/bin/"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+        "$HOME/.local/bin/${exe}" -js -m 8222 &
+
+        for _ in $(seq 1 30); do
+          if curl -fsS http://127.0.0.1:8222/healthz >/dev/null 2>&1; then
+            echo "✅ nats-server 已就绪"
+            exit 0
+          fi
+          sleep 1
+        done
+        echo "::error title=nats-server 没起来 | nats-server did not come up::等了 30 秒 healthz 仍不通"
+        exit 1
+    secrets:
+      # 显式映射而非 secrets: inherit —— inherit 跨账号调用时拿不到值
+      # [EN] Mapped explicitly rather than with secrets: inherit, which yields nothing across accounts
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

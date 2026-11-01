@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -27,8 +28,23 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// testNATSURL 指向测试用的 NATS 服务，默认本机
+//
+// 原先这里写死 nats://192.168.1.10:4222，那是某个开发网段的局域网地址：CI 连不上，
+// 别人机器上也连不上，于是每个用例都卡满 testTimeout 的 5 秒再失败
+// 现在默认 nats.DefaultURL（127.0.0.1:4222），需要连远端时用 TEST_NATS_URL 覆盖
+//
+// [EN] Points at the NATS server under test, defaulting to localhost. It used to be a hard-coded
+// LAN address from one development network, which CI and every other machine cannot reach, so
+// each case burned the full timeout before failing
+var testNATSURL = func() string {
+	if u := os.Getenv("TEST_NATS_URL"); u != "" {
+		return u
+	}
+	return nats.DefaultURL
+}()
+
 const (
-	testNATSURL     = "nats://192.168.1.10:4222"
 	testSubject     = "casbin.policy.test"
 	testTimeout     = 5 * time.Second
 	testWaitMessage = 2 * time.Second
