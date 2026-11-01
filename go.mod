@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/kamalyes/go-casbin v0.2.5
-	github.com/kamalyes/go-logger v0.9.0
+	github.com/kamalyes/go-logger v0.10.0
 	github.com/kamalyes/go-toolbox v0.19.2
 	github.com/nats-io/nats.go v1.39.1
 	github.com/stretchr/testify v1.12.1
